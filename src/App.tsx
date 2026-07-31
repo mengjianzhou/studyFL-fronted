@@ -6,6 +6,7 @@ import RegisterPage from './pages/RegisterPage'
 import HomePage from './pages/HomePage'
 import PracticePage from './pages/PracticePage'
 import StatsPage from './pages/StatsPage'
+import ManageBankPage from './pages/ManageBankPage'
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
   const token = useAuthStore((s) => s.token)
@@ -29,6 +30,7 @@ export default function App() {
         >
           <Route index element={<HomePage />} />
           <Route path="practice/:bankId" element={<PracticePage />} />
+          <Route path="manage/:bankId" element={<ManageBankPage />} />
           <Route path="stats" element={<StatsPage />} />
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />

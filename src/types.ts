@@ -5,6 +5,14 @@ export interface ApiResult<T> {
   data: T
 }
 
+/** 分页响应 */
+export interface PageResult<T> {
+  total: number
+  page: number
+  size: number
+  records: T[]
+}
+
 export interface User {
   id: number
   username: string
@@ -16,6 +24,22 @@ export interface User {
 export interface LoginResponse {
   token: string
   user: User
+}
+
+export interface WordVO {
+  id: number
+  word: string
+  phonetic: string | null
+  meaning: string | null
+  wordType: string | null
+}
+
+export interface SentenceVO {
+  id: number
+  english: string | null
+  chinese: string | null
+  japanese: string | null
+  sentenceType: string | null
 }
 
 export interface ProgressVO {

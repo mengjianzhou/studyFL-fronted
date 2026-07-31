@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useParams, useSearchParams } from 'react-router-dom'
+import { manageApi } from '../api/manage'
 import { practiceApi } from '../api/practice'
 import { useSpeech } from '../hooks/useSpeech'
 import { useLibraryStore } from '../stores/libraryStore'
@@ -10,10 +11,13 @@ type Phase = 'loading' | 'typing' | 'result' | 'dictation' | 'dictationResult'
 /**
  * 打字背单词练习页（QWERTY Learner 风格）
  *
- * 比对策略：
- * - 英语（en）：逐字符实时比对，打错抖动+清空重打（形成正确肌肉记忆）
- * - 日语（ja）：整词比对 —— 日语依赖 IME 输入法（罗马音→假名组合过程会连续触发
- *   onChange），逐字符比对会永远判错形成死循环，故输入完整后按 Enter/按钮提交比对
+ * 输入策略矩阵：
+ * - 单词模式 + 英语：逐字符实时比对，打错抖动+清空重打
+ * - 句子模式 + 英语：逐词判断 —— 每个单词独立标色（对=绿，错=红，不自动清空），
+ *   全部单词正确 + Enter 才跳下一句
+ * - 日语（任一模式）：整词比对 —— IME 输入法组合过程会连续触发 onChange，
+ *   逐字符/逐词比对会误判，输入完整后按 Enter/按钮提交
+ * - 默写模式：隐藏答案，整词 Enter 提交（逐词标色会泄题）
  */
 export default function PracticePage() {
   const { bankId } = useParams()
@@ -31,9 +35,6 @@ export default function PracticePage() {
     return null
   }, [tree, bankId])
 
-  /** 日语依赖 IME → 整词比对；英语逐字符比对 */
-  const isJa = bank?.langCode === 'ja'
-
   const [phase, setPhase] = useState<Phase>('loading')
   const [items, setItems] = useState<PracticeItem[]>([])
   const [mode] = useState<'word' | 'sentence'>(initialMode)
@@ -48,12 +49,23 @@ export default function PracticePage() {
   const [dictationScore, setDictationScore] = useState(0)
   const [submitting, setSubmitting] = useState(false)
   const [notice, setNotice] = useState('')
+  /** 编辑当前句子/单词弹窗 */
+  const [editOpen, setEditOpen] = useState(false)
 
   const startTimeRef = useRef(0)
   const inputRef = useRef<HTMLInputElement>(null)
-  /** 当前词是否打错过（correctFirst / dictationScore 的口径：一次打对） */
+  /** 本词是否打错过（correctFirst / dictationScore 口径：一次全对） */
   const wrongThisWordRef = useRef(false)
+  /** 逐词模式下已标红的词下标集合（避免重复计数） */
+  const wrongWordsRef = useRef<Set<number>>(new Set())
   const { speak, supported } = useSpeech(bank?.langCode ?? 'en')
+
+  const isDictationPhase = phase === 'dictation' || phase === 'dictationResult'
+
+  /** 日语依赖 IME → 整词比对 */
+  const isJa = bank?.langCode === 'ja'
+  /** 英语句子模式（非默写）→ 逐词判断标色 */
+  const isWordWise = mode === 'sentence' && !isJa && !isDictationPhase
 
   const resetRound = useCallback((newItems: PracticeItem[]) => {
     setItems(newItems)
@@ -64,6 +76,7 @@ export default function PracticePage() {
     setTotalKeystrokes(0)
     setElapsedMs(0)
     wrongThisWordRef.current = false
+    wrongWordsRef.current = new Set()
     setPhase('typing')
     startTimeRef.current = Date.now()
   }, [])
@@ -81,7 +94,6 @@ export default function PracticePage() {
           return
         }
         resetRound(res.items)
-        // 自动播放第一个词
         speak(res.items[0].text)
       })
       .catch((e) => setNotice((e as Error).message))
@@ -90,8 +102,52 @@ export default function PracticePage() {
   const current = items[currentIndex]
   // 大小写不敏感比对
   const normalizedTarget = useMemo(() => (current ? current.text.toLowerCase() : ''), [current])
+  /** 逐词判断：目标词数组 */
+  const targetWords = useMemo(
+    () => normalizedTarget.split(' ').filter((w) => w.length > 0),
+    [normalizedTarget],
+  )
 
-  /** 整词通过（日语模式）或整词失败 */
+  /** 解析用户输入：已完成词 + 进行中的词（过滤空格产生的空 token） */
+  const parseInput = useCallback(
+    (value: string) => {
+      const typed = value.split(' ')
+      const lastComplete = value.endsWith(' ')
+      let completed = lastComplete ? typed : typed.slice(0, -1)
+      completed = completed.filter((w) => w.length > 0)
+      const currentWord = lastComplete ? '' : typed[typed.length - 1] ?? ''
+      return { typed, completed, currentWord, lastComplete }
+    },
+    [],
+  )
+
+  /** 当前每个词块的判定状态：green / red / active / pending */
+  const wordStates = useMemo(() => {
+    if (!isWordWise || !current) return []
+    const { completed, currentWord, lastComplete } = parseInput(input)
+    const states: Array<'green' | 'red' | 'active' | 'pending'> = []
+    for (let i = 0; i < targetWords.length; i++) {
+      if (i < completed.length) {
+        states.push(completed[i].toLowerCase() === targetWords[i] ? 'green' : 'red')
+      } else if (i === completed.length && !lastComplete) {
+        // 正在输入的词：完整匹配→绿（可不按空格直接 Enter），前缀→active，不匹配→红
+        if (currentWord.length === 0) {
+          states.push('active')
+        } else if (targetWords[i] === currentWord.toLowerCase()) {
+          states.push('green')
+        } else if (targetWords[i].startsWith(currentWord.toLowerCase())) {
+          states.push('active')
+        } else {
+          states.push('red')
+        }
+      } else {
+        states.push('pending')
+      }
+    }
+    return states
+  }, [isWordWise, current, input, targetWords, parseInput])
+
+  /** 整词通过（日语 / 默写模式）：Enter 提交整词比对 */
   const checkWhole = useCallback(() => {
     if (!current) return
     setTotalKeystrokes((n) => n + input.length)
@@ -120,7 +176,7 @@ export default function PracticePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [input, current, currentIndex, items.length, phase, speak])
 
-  /** 逐字符比对（英语模式） */
+  /** 逐字符比对（单词模式 + 英语） */
   const handleCharInput = useCallback(
     (value: string) => {
       if (phase !== 'typing' && phase !== 'dictation') return
@@ -145,9 +201,7 @@ export default function PracticePage() {
           setTimeout(() => setFlash(false), 400)
           if (phase === 'typing' && oneShot) setCorrectFirst((n) => n + 1)
           if (phase === 'dictation' && oneShot) setDictationScore((n) => n + 1)
-          // 播发音
           speak(current.text)
-          // 下一词或完成
           if (currentIndex + 1 >= items.length) {
             finish()
           } else {
@@ -169,23 +223,102 @@ export default function PracticePage() {
     [current, currentIndex, input, items.length, normalizedTarget, phase, speak],
   )
 
-  /** 输入变化：日语整词模式自由输入，英语逐字符比对 */
+  /**
+   * 逐词判断（句子模式 + 英语）
+   * 每个单词独立标色：正确绿色 / 错误红色（不清空），全部正确 + Enter 跳下一句
+   */
+  const handleWordWiseInput = useCallback(
+    (value: string) => {
+      if (!current) return
+      setTotalKeystrokes((n) => n + (value.length > input.length ? 1 : 0))
+      setInput(value)
+
+      // 实时判定：标记新出现的错误词（Set 去重，不重复计数）
+      const { completed, currentWord, lastComplete } = parseInput(value)
+      const newWrong: number[] = []
+      for (let i = 0; i < completed.length; i++) {
+        if (i >= targetWords.length || completed[i].toLowerCase() !== targetWords[i]) {
+          newWrong.push(i)
+        }
+      }
+      // 正在输入词：前缀不匹配（已打错）
+      if (!lastComplete && completed.length < targetWords.length) {
+        const target = targetWords[completed.length]
+        if (currentWord.length > 0 && !target.startsWith(currentWord.toLowerCase())) {
+          newWrong.push(completed.length)
+        }
+      }
+      if (newWrong.length > 0) {
+        wrongThisWordRef.current = true
+        for (const idx of newWrong) {
+          if (!wrongWordsRef.current.has(idx)) {
+            wrongWordsRef.current.add(idx)
+            setErrorCount((n) => n + 1)
+          }
+        }
+      }
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [current, input, targetWords, parseInput],
+  )
+
+  /** 输入分发：日语/默写 → 整词；单词+英语 → 逐字符；句子+英语 → 逐词 */
   const handleChange = useCallback(
     (value: string) => {
-      if (isJa) {
+      if (phase !== 'typing' && phase !== 'dictation') return
+      if (isJa || phase === 'dictation') {
         setInput(value)
+      } else if (mode === 'sentence') {
+        handleWordWiseInput(value)
       } else {
         handleCharInput(value)
       }
     },
-    [isJa, handleCharInput],
+    [isJa, mode, phase, handleCharInput, handleWordWiseInput],
   )
+
+  /** 逐词模式：全部词正确且按 Enter → 跳下一句 */
+  const handleWordWiseEnter = useCallback(() => {
+    if (!current) return
+    const { completed, currentWord, lastComplete } = parseInput(input)
+    // 所有目标词都已正确输入（最后一个词可不按空格，完整匹配即可）
+    const typedCount = lastComplete ? completed.length : completed.length + 1
+    const allCorrect =
+      typedCount === targetWords.length &&
+      targetWords.every((w, i) => {
+        if (i < completed.length) return completed[i].toLowerCase() === w
+        return currentWord.toLowerCase() === w
+      })
+    if (!allCorrect) {
+      // 未完成、有多余词或还有错误 → Enter 无效，提示
+      setShake(true)
+      setTimeout(() => setShake(false), 400)
+      setNotice(typedCount > targetWords.length ? '输入了多余的单词' : '还有未完成或错误的单词')
+      setTimeout(() => setNotice(''), 1500)
+      return
+    }
+    // 全部正确 → 完成本句
+    const oneShot = !wrongThisWordRef.current
+    wrongThisWordRef.current = false
+    wrongWordsRef.current = new Set()
+    setInput('')
+    setFlash(true)
+    setTimeout(() => setFlash(false), 400)
+    if (phase === 'typing' && oneShot) setCorrectFirst((n) => n + 1)
+    if (phase === 'dictation' && oneShot) setDictationScore((n) => n + 1)
+    speak(current.text)
+    if (currentIndex + 1 >= items.length) {
+      finish()
+    } else {
+      setCurrentIndex((i) => i + 1)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [input, current, currentIndex, items.length, phase, speak, targetWords, parseInput])
 
   const finish = useCallback(() => {
     const elapsed = Date.now() - startTimeRef.current
     setElapsedMs(elapsed)
     setPhase((p) => (p === 'dictation' ? 'dictationResult' : 'result'))
-    // 提交记录
     setSubmitting(true)
     practiceApi
       .submit({
@@ -225,6 +358,7 @@ export default function PracticePage() {
     setTotalKeystrokes(0)
     setCurrentIndex(0)
     wrongThisWordRef.current = false
+    wrongWordsRef.current = new Set()
     startTimeRef.current = Date.now()
     const shuffled = [...items].sort(() => Math.random() - 0.5)
     setItems(shuffled)
@@ -266,7 +400,64 @@ export default function PracticePage() {
   // 计算实时指标
   const wpm = elapsedMs > 0 && currentIndex > 0 ? Math.round((currentIndex / (elapsedMs / 60000)) * 10) / 10 : 0
   const accuracy = totalKeystrokes > 0 ? Math.round(((totalKeystrokes - errorCount) / totalKeystrokes) * 1000) / 10 : 100
-  const isDictation = phase === 'dictation' || phase === 'dictationResult'
+
+  /** 保存编辑后的句子/单词：更新数据库 + 更新本地词表继续练习 */
+  const handleEditSave = useCallback(
+    async (data: { text: string; meaning?: string; extra?: string; phonetic?: string }) => {
+      if (!current) return
+      try {
+        if (mode === 'sentence') {
+          const updated = await manageApi.updateSentence(current.id, {
+            english: data.text || undefined,
+            chinese: data.meaning || undefined,
+            japanese: data.extra || undefined,
+          })
+          setItems((list) =>
+            list.map((it) =>
+              it.id === current.id
+                ? {
+                    ...it,
+                    text: updated.english ?? it.text,
+                    meaning: updated.chinese ?? it.meaning,
+                    extra: updated.japanese ?? it.extra,
+                  }
+                : it,
+            ),
+          )
+        } else {
+          const updated = await manageApi.updateWord(current.id, {
+            word: data.text,
+            phonetic: data.phonetic || undefined,
+            meaning: data.meaning || undefined,
+            wordType: data.extra || undefined,
+          })
+          setItems((list) =>
+            list.map((it) =>
+              it.id === current.id
+                ? {
+                    ...it,
+                    text: updated.word,
+                    phonetic: updated.phonetic ?? it.phonetic,
+                    meaning: updated.meaning ?? it.meaning,
+                    extra: updated.wordType ?? it.extra,
+                  }
+                : it,
+            ),
+          )
+        }
+        setEditOpen(false)
+        // 目标已变化，清空当前输入从头打
+        setInput('')
+        wrongThisWordRef.current = false
+        wrongWordsRef.current = new Set()
+        setNotice('已保存修改')
+        setTimeout(() => setNotice(''), 2000)
+      } catch (e) {
+        setNotice((e as Error).message)
+      }
+    },
+    [current, mode],
+  )
 
   if (!bank) return <div className="flex h-full items-center justify-center text-slate-400">词库不存在</div>
 
@@ -302,21 +493,44 @@ export default function PracticePage() {
 
       {(phase === 'typing' || phase === 'dictation') && current && (
         <div className={`flex flex-1 flex-col items-center justify-center ${flash ? 'animate-flash rounded-xl' : ''}`}>
-          {/* 单词大字（默写模式隐藏） */}
-          {!isDictation && (
+          {/* 单词模式：大字单词；逐词模式：彩色词块；默写：隐藏 */}
+          {!isDictationPhase && !isWordWise && (
             <>
               <div className="mb-1 text-5xl font-bold tracking-wide text-slate-800">{current.text}</div>
               {current.phonetic && <div className="mb-2 text-lg text-slate-400">{current.phonetic}</div>}
             </>
           )}
-          {isDictation && (
+          {isWordWise && (
+            <>
+              <div className="mb-3 flex max-w-2xl flex-wrap items-center justify-center gap-1.5">
+                {targetWords.map((w, i) => (
+                  <span
+                    key={i}
+                    className={`rounded-lg px-2.5 py-1 text-lg font-medium transition-colors ${
+                      wordStates[i] === 'green'
+                        ? 'bg-green-100 text-green-600'
+                        : wordStates[i] === 'red'
+                          ? 'bg-red-100 text-red-500'
+                          : wordStates[i] === 'active'
+                            ? 'bg-brand-bg text-brand-dark ring-2 ring-brand'
+                            : 'bg-slate-100 text-slate-400'
+                    }`}
+                  >
+                    {w}
+                  </span>
+                ))}
+              </div>
+              {current.phonetic && <div className="mb-2 text-lg text-slate-400">{current.phonetic}</div>}
+            </>
+          )}
+          {isDictationPhase && (
             <>
               <div className="mb-1 text-4xl font-bold text-slate-800">✍️ 默写模式</div>
               {current.phonetic && <div className="mb-2 text-lg text-slate-400">{current.phonetic}</div>}
             </>
           )}
 
-          {/* 发音按钮 + 释义提示 */}
+          {/* 发音按钮 + 编辑 + 释义提示 */}
           <div className="mb-6 flex items-center gap-3">
             <button
               onClick={() => speak(current.text)}
@@ -326,7 +540,16 @@ export default function PracticePage() {
             >
               🔊
             </button>
-            {isDictation && current.meaning && (
+            {!isDictationPhase && (
+              <button
+                onClick={() => setEditOpen(true)}
+                className="rounded-full bg-slate-100 p-2.5 text-slate-500 transition hover:bg-slate-200 hover:text-slate-700"
+                title={mode === 'sentence' ? '编辑这个句子' : '编辑这个单词'}
+              >
+                ✏️
+              </button>
+            )}
+            {isDictationPhase && current.meaning && (
               <button
                 onClick={() => setNotice(`提示：${current.meaning}`)}
                 className="text-xs text-slate-400 underline hover:text-brand-dark"
@@ -334,7 +557,7 @@ export default function PracticePage() {
                 提示释义
               </button>
             )}
-            {!isDictation && current.meaning && (
+            {!isDictationPhase && !isWordWise && current.meaning && (
               <span className="text-sm text-slate-500">{current.meaning}</span>
             )}
           </div>
@@ -351,24 +574,33 @@ export default function PracticePage() {
                 value={input}
                 onChange={(e) => handleChange(e.target.value)}
                 onKeyDown={(e) => {
-                  if (isJa) {
-                    // 日语：Enter 提交整词（IME 组合中的 Enter 不触发）
-                    if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
+                  if (e.key === 'Enter') {
+                    if (isJa || isDictationPhase) {
+                      // 日语 / 默写：整词提交（IME 组合中的 Enter 不触发）
+                      if (!e.nativeEvent.isComposing) {
+                        e.preventDefault()
+                        checkWhole()
+                      }
+                    } else if (mode === 'sentence') {
+                      // 逐词模式：全部正确才生效
                       e.preventDefault()
-                      checkWhole()
+                      handleWordWiseEnter()
                     }
                   } else if (e.key === 'Backspace') {
-                    e.preventDefault()
+                    // 逐字符模式不允许退格；逐词/整词模式允许（错误不清除，可自行修改）
+                    if (mode === 'word' && !isJa) e.preventDefault()
                   }
                 }}
                 placeholder={
                   isJa
-                    ? isDictation
+                    ? isDictationPhase
                       ? '凭记忆输入，Enter 提交…'
                       : '用输入法输入，Enter 提交…'
-                    : isDictation
-                      ? '凭记忆输入…'
-                      : '开始打字…'
+                    : isDictationPhase
+                      ? '凭记忆输入，Enter 提交…'
+                      : mode === 'sentence'
+                        ? '逐词输入，空格分隔，全部正确后按 Enter…'
+                        : '开始打字…'
                 }
                 className="w-full bg-transparent text-center font-mono outline-none placeholder:text-slate-300"
                 autoCapitalize="off"
@@ -377,7 +609,7 @@ export default function PracticePage() {
                 spellCheck={false}
                 lang={bank.langCode}
               />
-              {isJa && (
+              {(isJa || isDictationPhase) && (
                 <button
                   onClick={checkWhole}
                   className="shrink-0 rounded-lg bg-brand px-3 py-1.5 text-sm font-medium text-white transition hover:bg-brand-dark"
@@ -385,11 +617,23 @@ export default function PracticePage() {
                   提交
                 </button>
               )}
+              {isWordWise && (
+                <button
+                  onClick={handleWordWiseEnter}
+                  className="shrink-0 rounded-lg bg-brand px-3 py-1.5 text-sm font-medium text-white transition hover:bg-brand-dark"
+                >
+                  确认
+                </button>
+              )}
             </div>
             <p className="mt-2 text-center text-xs text-slate-400">
               {isJa
                 ? '输入完整内容后按 Enter 或点提交 · 错误会清空重来'
-                : '打错会清空重来 · 逐字符比对 · 退格无效'}
+                : isDictationPhase
+                  ? '凭记忆输入 · Enter 提交 · 错误会清空重来'
+                  : mode === 'sentence'
+                    ? '每个单词独立判断：绿色正确 / 红色错误（不自动清除）· 全部正确 + Enter 跳下一句'
+                    : '打错会清空重来 · 逐字符比对 · 退格无效'}
               {' · '}
               {currentIndex + 1}/{items.length}
             </p>
@@ -408,7 +652,6 @@ export default function PracticePage() {
           submitting={submitting}
           onRestart={restart}
           onDictation={items.length >= 3 ? startDictation : undefined}
-          onBack={undefined}
         />
       )}
 
@@ -422,7 +665,16 @@ export default function PracticePage() {
           errorCount={errorCount}
           submitting={submitting}
           onRestart={startDictation}
-          onBack={undefined}
+        />
+      )}
+
+      {/* 编辑当前句子/单词弹窗 */}
+      {editOpen && current && (
+        <EditItemModal
+          mode={mode}
+          item={current}
+          onClose={() => setEditOpen(false)}
+          onSave={handleEditSave}
         />
       )}
 
@@ -465,13 +717,12 @@ function ResultPanel({
   submitting: boolean
   onRestart?: () => void
   onDictation?: () => void
-  onBack?: () => void
 }) {
   return (
     <div className="flex flex-1 flex-col items-center justify-center">
       <h2 className="mb-8 text-3xl font-bold text-slate-800">{title}</h2>
       <div className="mb-8 grid grid-cols-2 gap-4 sm:grid-cols-4">
-        <StatCard label="一次打对" value={`${correctFirst}/${total}`} />
+        <StatCard label="一次全对" value={`${correctFirst}/${total}`} />
         <StatCard label="正确率" value={`${accuracy}%`} />
         <StatCard label="速度" value={`${wpm} WPM`} />
         <StatCard label="错误按键" value={`${errorCount}`} />
@@ -510,6 +761,105 @@ function StatCard({ label, value }: { label: string; value: string }) {
     <div className="rounded-xl border border-slate-200 bg-white px-6 py-4 text-center shadow-sm">
       <div className="text-xl font-bold text-brand-dark">{value}</div>
       <div className="mt-1 text-xs text-slate-400">{label}</div>
+    </div>
+  )
+}
+
+/** 编辑当前句子/单词弹窗（发现内容有误时直接修改） */
+function EditItemModal({
+  mode,
+  item,
+  onClose,
+  onSave,
+}: {
+  mode: 'word' | 'sentence'
+  item: PracticeItem
+  onClose: () => void
+  onSave: (data: { text: string; meaning?: string; extra?: string; phonetic?: string }) => void
+}) {
+  const [text, setText] = useState(item.text)
+  const [meaning, setMeaning] = useState(item.meaning ?? '')
+  const [extra, setExtra] = useState(item.extra ?? '')
+  const [phonetic, setPhonetic] = useState(item.phonetic ?? '')
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+
+  const save = async () => {
+    if (!text.trim()) {
+      setError(mode === 'sentence' ? '英文内容不能为空' : '单词不能为空')
+      return
+    }
+    setSaving(true)
+    try {
+      await onSave({ text: text.trim(), meaning: meaning.trim() || undefined, extra: extra.trim() || undefined, phonetic: phonetic.trim() || undefined })
+    } catch (e) {
+      setError((e as Error).message)
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30" onClick={onClose}>
+      <div
+        className="w-full max-w-md rounded-2xl bg-white p-6 shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3 className="mb-4 text-lg font-semibold text-slate-800">
+          {mode === 'sentence' ? '编辑句子' : '编辑单词'}
+        </h3>
+        {mode === 'sentence' ? (
+          <div className="space-y-3">
+            <EditField label="英文" value={text} onChange={setText} placeholder="English sentence" />
+            <EditField label="中文" value={meaning} onChange={setMeaning} placeholder="中文翻译" />
+            <EditField label="日文" value={extra} onChange={setExtra} placeholder="日本語" />
+          </div>
+        ) : (
+          <div className="space-y-3">
+            <EditField label="单词" value={text} onChange={setText} placeholder="如 apple" />
+            <EditField label="音标" value={phonetic} onChange={setPhonetic} placeholder="如 /ˈæpl/" />
+            <EditField label="释义" value={meaning} onChange={setMeaning} placeholder="如 苹果" />
+            <EditField label="词性" value={extra} onChange={setExtra} placeholder="如 n." />
+          </div>
+        )}
+        {error && <p className="text-sm text-red-500">{error}</p>}
+        <p className="mt-2 text-xs text-slate-400">修改会保存到词库，所有用户都能看到；当前词将从新内容重新练习</p>
+        <div className="mt-5 flex justify-end gap-3">
+          <button onClick={onClose} className="rounded-lg border border-slate-300 px-4 py-2 text-sm text-slate-600 hover:bg-slate-50">
+            取消
+          </button>
+          <button
+            onClick={save}
+            disabled={saving}
+            className="rounded-lg bg-brand px-4 py-2 text-sm font-medium text-white transition hover:bg-brand-dark disabled:opacity-60"
+          >
+            {saving ? '保存中…' : '保存'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function EditField({
+  label,
+  value,
+  onChange,
+  placeholder,
+}: {
+  label: string
+  value: string
+  onChange: (v: string) => void
+  placeholder?: string
+}) {
+  return (
+    <div>
+      <label className="mb-1 block text-xs font-medium text-slate-500">{label}</label>
+      <input
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand-light"
+      />
     </div>
   )
 }
