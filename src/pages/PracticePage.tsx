@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useParams, useSearchParams } from 'react-router-dom'
 import { manageApi } from '../api/manage'
 import { practiceApi } from '../api/practice'
+import { translateApi } from '../api/translate'
 import { useSpeech } from '../hooks/useSpeech'
 import { useLibraryStore } from '../stores/libraryStore'
 import type { PracticeItem } from '../types'
@@ -49,8 +50,8 @@ export default function PracticePage() {
   const [dictationScore, setDictationScore] = useState(0)
   const [submitting, setSubmitting] = useState(false)
   const [notice, setNotice] = useState('')
-  /** 编辑当前句子/单词弹窗 */
-  const [editOpen, setEditOpen] = useState(false)
+  /** 编辑/新增弹窗：edit = 修改当前词，create = 新增到本词库 */
+  const [dialog, setDialog] = useState<null | { action: 'edit' } | { action: 'create' }>(null)
 
   const startTimeRef = useRef(0)
   const inputRef = useRef<HTMLInputElement>(null)
@@ -94,14 +95,14 @@ export default function PracticePage() {
           return
         }
         resetRound(res.items)
-        speak(res.items[0].text)
+        speak(res.items[0].text ?? '')
       })
       .catch((e) => setNotice((e as Error).message))
   }, [bankId, mode, speak, resetRound])
 
   const current = items[currentIndex]
-  // 大小写不敏感比对
-  const normalizedTarget = useMemo(() => (current ? current.text.toLowerCase() : ''), [current])
+  // 大小写不敏感比对（text 可能为 null：只填了日文没填英文的句子）
+  const normalizedTarget = useMemo(() => (current?.text?.toLowerCase() ?? ''), [current])
   /** 逐词判断：目标词数组 */
   const targetWords = useMemo(
     () => normalizedTarget.split(' ').filter((w) => w.length > 0),
@@ -151,7 +152,7 @@ export default function PracticePage() {
   const checkWhole = useCallback(() => {
     if (!current) return
     setTotalKeystrokes((n) => n + input.length)
-    const ok = input.trim().toLowerCase() === current.text.trim().toLowerCase()
+    const ok = input.trim().toLowerCase() === (current.text?.trim().toLowerCase() ?? '')
     if (ok) {
       const oneShot = !wrongThisWordRef.current && input.length > 0
       wrongThisWordRef.current = false
@@ -160,7 +161,7 @@ export default function PracticePage() {
       setTimeout(() => setFlash(false), 400)
       if (phase === 'typing' && oneShot) setCorrectFirst((n) => n + 1)
       if (phase === 'dictation' && oneShot) setDictationScore((n) => n + 1)
-      speak(current.text)
+      speak(current.text ?? '')
       if (currentIndex + 1 >= items.length) {
         finish()
       } else {
@@ -201,7 +202,7 @@ export default function PracticePage() {
           setTimeout(() => setFlash(false), 400)
           if (phase === 'typing' && oneShot) setCorrectFirst((n) => n + 1)
           if (phase === 'dictation' && oneShot) setDictationScore((n) => n + 1)
-          speak(current.text)
+          speak(current.text ?? '')
           if (currentIndex + 1 >= items.length) {
             finish()
           } else {
@@ -306,7 +307,7 @@ export default function PracticePage() {
     setTimeout(() => setFlash(false), 400)
     if (phase === 'typing' && oneShot) setCorrectFirst((n) => n + 1)
     if (phase === 'dictation' && oneShot) setDictationScore((n) => n + 1)
-    speak(current.text)
+    speak(current.text ?? '')
     if (currentIndex + 1 >= items.length) {
       finish()
     } else {
@@ -445,7 +446,7 @@ export default function PracticePage() {
             ),
           )
         }
-        setEditOpen(false)
+        setDialog(null)
         // 目标已变化，清空当前输入从头打
         setInput('')
         wrongThisWordRef.current = false
@@ -457,6 +458,51 @@ export default function PracticePage() {
       }
     },
     [current, mode],
+  )
+
+  /** 新增句子/单词到当前词库（与当前页面相同的词库组/词库），追加到会话末尾 */
+  const handleAddSave = useCallback(
+    async (data: { text: string; meaning?: string; extra?: string; phonetic?: string }) => {
+      if (!bankId) return
+      try {
+        let newItem: PracticeItem
+        if (mode === 'sentence') {
+          const created = await manageApi.createSentence(Number(bankId), {
+            english: data.text,
+            chinese: data.meaning || undefined,
+            japanese: data.extra || undefined,
+          })
+          newItem = {
+            id: created.id,
+            text: created.english ?? data.text,
+            phonetic: null,
+            meaning: created.chinese ?? '',
+            extra: created.japanese ?? '',
+          }
+        } else {
+          const created = await manageApi.createWord(Number(bankId), {
+            word: data.text,
+            phonetic: data.phonetic || undefined,
+            meaning: data.meaning || undefined,
+            wordType: data.extra || undefined,
+          })
+          newItem = {
+            id: created.id,
+            text: created.word,
+            phonetic: created.phonetic ?? null,
+            meaning: created.meaning ?? '',
+            extra: created.wordType ?? null,
+          }
+        }
+        setItems((list) => [...list, newItem])
+        setDialog(null)
+        setNotice('已添加到本词库，稍后就练到它')
+        setTimeout(() => setNotice(''), 2500)
+      } catch (e) {
+        setNotice((e as Error).message)
+      }
+    },
+    [bankId, mode],
   )
 
   if (!bank) return <div className="flex h-full items-center justify-center text-slate-400">词库不存在</div>
@@ -496,7 +542,7 @@ export default function PracticePage() {
           {/* 单词模式：大字单词；逐词模式：彩色词块；默写：隐藏 */}
           {!isDictationPhase && !isWordWise && (
             <>
-              <div className="mb-1 text-5xl font-bold tracking-wide text-slate-800">{current.text}</div>
+              <div className="mb-1 text-5xl font-bold tracking-wide text-slate-800">{current.text ?? ''}</div>
               {current.phonetic && <div className="mb-2 text-lg text-slate-400">{current.phonetic}</div>}
             </>
           )}
@@ -533,7 +579,7 @@ export default function PracticePage() {
           {/* 发音按钮 + 编辑 + 释义提示 */}
           <div className="mb-6 flex items-center gap-3">
             <button
-              onClick={() => speak(current.text)}
+              onClick={() => speak(current.text ?? '')}
               disabled={!supported}
               className="rounded-full bg-brand-bg p-2.5 text-brand-dark transition hover:bg-brand-light disabled:opacity-40"
               title="发音"
@@ -541,13 +587,22 @@ export default function PracticePage() {
               🔊
             </button>
             {!isDictationPhase && (
-              <button
-                onClick={() => setEditOpen(true)}
-                className="rounded-full bg-slate-100 p-2.5 text-slate-500 transition hover:bg-slate-200 hover:text-slate-700"
-                title={mode === 'sentence' ? '编辑这个句子' : '编辑这个单词'}
-              >
-                ✏️
-              </button>
+              <>
+                <button
+                  onClick={() => setDialog({ action: 'create' })}
+                  className="rounded-full bg-slate-100 p-2.5 text-slate-500 transition hover:bg-slate-200 hover:text-slate-700"
+                  title={mode === 'sentence' ? '新增句子到本词库' : '新增单词到本词库'}
+                >
+                  ➕
+                </button>
+                <button
+                  onClick={() => setDialog({ action: 'edit' })}
+                  className="rounded-full bg-slate-100 p-2.5 text-slate-500 transition hover:bg-slate-200 hover:text-slate-700"
+                  title={mode === 'sentence' ? '编辑这个句子' : '编辑这个单词'}
+                >
+                  ✏️
+                </button>
+              </>
             )}
             {isDictationPhase && current.meaning && (
               <button
@@ -668,13 +723,16 @@ export default function PracticePage() {
         />
       )}
 
-      {/* 编辑当前句子/单词弹窗 */}
-      {editOpen && current && (
+      {/* 编辑/新增弹窗 */}
+      {dialog && current && (
         <EditItemModal
           mode={mode}
+          action={dialog.action}
           item={current}
-          onClose={() => setEditOpen(false)}
+          isJa={isJa}
+          onClose={() => setDialog(null)}
           onSave={handleEditSave}
+          onCreate={handleAddSave}
         />
       )}
 
@@ -765,24 +823,48 @@ function StatCard({ label, value }: { label: string; value: string }) {
   )
 }
 
-/** 编辑当前句子/单词弹窗（发现内容有误时直接修改） */
+/** 编辑/新增句子或单词弹窗：edit = 修改当前词，create = 新增到本词库 */
 function EditItemModal({
   mode,
+  action,
   item,
+  isJa,
   onClose,
   onSave,
+  onCreate,
 }: {
   mode: 'word' | 'sentence'
+  action: 'edit' | 'create'
   item: PracticeItem
+  isJa: boolean
   onClose: () => void
   onSave: (data: { text: string; meaning?: string; extra?: string; phonetic?: string }) => void
+  onCreate: (data: { text: string; meaning?: string; extra?: string; phonetic?: string }) => void
 }) {
-  const [text, setText] = useState(item.text)
-  const [meaning, setMeaning] = useState(item.meaning ?? '')
-  const [extra, setExtra] = useState(item.extra ?? '')
-  const [phonetic, setPhonetic] = useState(item.phonetic ?? '')
+  const isCreate = action === 'create'
+  // 日语模式句子：日文优先布局 + 自动翻译（新增和编辑一致）
+  const jaLayout = isJa && mode === 'sentence'
+  const [text, setText] = useState(isCreate ? '' : item.text ?? '')
+  const [meaning, setMeaning] = useState(isCreate ? '' : item.meaning ?? '')
+  const [extra, setExtra] = useState(isCreate ? '' : item.extra ?? '')
+  const [phonetic, setPhonetic] = useState(isCreate ? '' : item.phonetic ?? '')
   const [saving, setSaving] = useState(false)
+  const [translating, setTranslating] = useState(false)
   const [error, setError] = useState('')
+
+  /** 日文输入结束（失焦）→ 自动翻译成英文填充（英文为空时才翻译） */
+  const handleJaBlur = async () => {
+    if (!extra.trim() || text.trim() || translating) return
+    setTranslating(true)
+    try {
+      const en = await translateApi.jaToEn(extra.trim())
+      if (en) setText(en)
+    } catch {
+      // 翻译失败静默处理，用户可手动输入英文
+    } finally {
+      setTranslating(false)
+    }
+  }
 
   const save = async () => {
     if (!text.trim()) {
@@ -791,7 +873,9 @@ function EditItemModal({
     }
     setSaving(true)
     try {
-      await onSave({ text: text.trim(), meaning: meaning.trim() || undefined, extra: extra.trim() || undefined, phonetic: phonetic.trim() || undefined })
+      const data = { text: text.trim(), meaning: meaning.trim() || undefined, extra: extra.trim() || undefined, phonetic: phonetic.trim() || undefined }
+      if (isCreate) await onCreate(data)
+      else await onSave(data)
     } catch (e) {
       setError((e as Error).message)
       setSaving(false)
@@ -805,14 +889,32 @@ function EditItemModal({
         onClick={(e) => e.stopPropagation()}
       >
         <h3 className="mb-4 text-lg font-semibold text-slate-800">
-          {mode === 'sentence' ? '编辑句子' : '编辑单词'}
+          {isCreate
+            ? `新增${mode === 'sentence' ? '句子' : '单词'}到本词库`
+            : `${mode === 'sentence' ? '编辑句子' : '编辑单词'}`}
         </h3>
         {mode === 'sentence' ? (
-          <div className="space-y-3">
-            <EditField label="英文" value={text} onChange={setText} placeholder="English sentence" />
-            <EditField label="中文" value={meaning} onChange={setMeaning} placeholder="中文翻译" />
-            <EditField label="日文" value={extra} onChange={setExtra} placeholder="日本語" />
-          </div>
+          jaLayout ? (
+            /* 日语模式新增：日文在前（失焦自动翻译英文），中文手动输入 */
+            <div className="space-y-3">
+              <EditField
+                label="日文"
+                value={extra}
+                onChange={setExtra}
+                onBlur={handleJaBlur}
+                placeholder="日本語（输入完成鼠标点别处自动翻译英文）"
+                hint={translating ? '正在翻译成英文…' : '输入日文后离开输入框，自动翻译英文'}
+              />
+              <EditField label="中文" value={meaning} onChange={setMeaning} placeholder="中文翻译（手动输入）" />
+              <EditField label="英文（自动翻译）" value={text} onChange={setText} placeholder="English（可手动修改）" />
+            </div>
+          ) : (
+            <div className="space-y-3">
+              <EditField label="英文" value={text} onChange={setText} placeholder="English sentence" />
+              <EditField label="中文" value={meaning} onChange={setMeaning} placeholder="中文翻译" />
+              <EditField label="日文" value={extra} onChange={setExtra} placeholder="日本語" />
+            </div>
+          )
         ) : (
           <div className="space-y-3">
             <EditField label="单词" value={text} onChange={setText} placeholder="如 apple" />
@@ -822,17 +924,21 @@ function EditItemModal({
           </div>
         )}
         {error && <p className="text-sm text-red-500">{error}</p>}
-        <p className="mt-2 text-xs text-slate-400">修改会保存到词库，所有用户都能看到；当前词将从新内容重新练习</p>
+        <p className="mt-2 text-xs text-slate-400">
+          {isCreate
+            ? '新增内容归属当前词库（与当前练习相同的词库组/词库），追加到本轮练习末尾'
+            : '修改会保存到词库，所有用户都能看到；当前词将从新内容重新练习'}
+        </p>
         <div className="mt-5 flex justify-end gap-3">
           <button onClick={onClose} className="rounded-lg border border-slate-300 px-4 py-2 text-sm text-slate-600 hover:bg-slate-50">
             取消
           </button>
           <button
             onClick={save}
-            disabled={saving}
+            disabled={saving || translating}
             className="rounded-lg bg-brand px-4 py-2 text-sm font-medium text-white transition hover:bg-brand-dark disabled:opacity-60"
           >
-            {saving ? '保存中…' : '保存'}
+            {saving ? '保存中…' : translating ? '翻译中…' : isCreate ? '添加' : '保存'}
           </button>
         </div>
       </div>
@@ -844,12 +950,16 @@ function EditField({
   label,
   value,
   onChange,
+  onBlur,
   placeholder,
+  hint,
 }: {
   label: string
   value: string
   onChange: (v: string) => void
+  onBlur?: () => void
   placeholder?: string
+  hint?: string
 }) {
   return (
     <div>
@@ -857,9 +967,11 @@ function EditField({
       <input
         value={value}
         onChange={(e) => onChange(e.target.value)}
+        onBlur={onBlur}
         placeholder={placeholder}
         className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand-light"
       />
+      {hint && <p className="mt-1 text-xs text-brand-dark">{hint}</p>}
     </div>
   )
 }
