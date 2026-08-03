@@ -2,17 +2,39 @@ import { useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { manageApi } from '../api/manage'
 import { useLibraryStore } from '../stores/libraryStore'
+import ConfirmModal from '../components/ConfirmModal'
 import type { BankVO, LanguageVO } from '../types'
 
 type ModalState = null | { kind: 'group'; lang: LanguageVO } | { kind: 'bank'; lang: LanguageVO; groupId: number; groupName: string }
+
+type ConfirmState =
+  | null
+  | { kind: 'group'; groupId: number; name: string }
+  | { kind: 'bank'; bankId: number; name: string }
 
 /** 词库选择页：语言 Tab → 词库组卡片 → 词库列表（双模式 + 进度条）+ 添加管理 */
 export default function HomePage() {
   const { tree, loading, error, fetchTree } = useLibraryStore()
   const [activeLangId, setActiveLangId] = useState<number | null>(null)
   const [modal, setModal] = useState<ModalState>(null)
+  const [confirm, setConfirm] = useState<ConfirmState>(null)
   const [notice, setNotice] = useState('')
   const navigate = useNavigate()
+
+  const executeDelete = async () => {
+    if (!confirm) return
+    try {
+      if (confirm.kind === 'group') {
+        await manageApi.deleteGroup(confirm.groupId)
+      } else {
+        await manageApi.deleteBank(confirm.bankId)
+      }
+      setConfirm(null)
+      refresh()
+    } catch (e) {
+      setNotice((e as Error).message)
+    }
+  }
 
   const refresh = async () => {
     try {
@@ -89,16 +111,14 @@ export default function HomePage() {
                 + 新增词库
               </button>
               <button
-                onClick={async () => {
-                  if (!window.confirm(`确认删除词库组「${group.name}」？其下所有词库和数据都会被删除！`)) return
-                  try {
-                    await manageApi.deleteGroup(group.id)
-                    refresh()
-                  } catch (e) {
-                    setNotice((e as Error).message)
-                  }
-                }}
-                className="rounded-lg border border-red-100 px-3 py-1.5 text-xs text-red-400 transition hover:bg-red-50"
+                disabled={group.banks.length > 0}
+                onClick={() => setConfirm({ kind: 'group', groupId: group.id, name: group.name })}
+                title={group.banks.length > 0 ? '请先删除该词库组下的所有词库' : '删除词库组'}
+                className={`rounded-lg border px-3 py-1.5 text-xs transition ${
+                  group.banks.length > 0
+                    ? 'cursor-not-allowed border-slate-100 text-slate-300'
+                    : 'border-red-100 text-red-400 hover:bg-red-50'
+                }`}
               >
                 删除
               </button>
@@ -106,7 +126,13 @@ export default function HomePage() {
           </div>
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             {group.banks.map((bank) => (
-              <BankCard key={bank.id} langCode={activeLang.code} bank={bank} onStart={navigate} onDeleted={refresh} onNotice={setNotice} />
+              <BankCard
+                key={bank.id}
+                langCode={activeLang.code}
+                bank={bank}
+                onStart={navigate}
+                onDeleteRequest={() => setConfirm({ kind: 'bank', bankId: bank.id, name: bank.name })}
+              />
             ))}
           </div>
           {group.banks.length === 0 && (
@@ -129,6 +155,23 @@ export default function HomePage() {
         />
       )}
 
+      {confirm && (
+        <ConfirmModal
+          open
+          title={confirm.kind === 'group' ? '删除词库组' : '删除词库'}
+          message={
+            confirm.kind === 'group'
+              ? `确认删除词库组「${confirm.name}」？其下所有词库和数据都会被删除！`
+              : `确认删除词库「${confirm.name}」？其中的单词/句子/学习记录都会被删除！`
+          }
+          confirmText="删除"
+          cancelText="取消"
+          danger
+          onConfirm={executeDelete}
+          onCancel={() => setConfirm(null)}
+        />
+      )}
+
       {notice && (
         <div className="fixed bottom-6 left-1/2 -translate-x-1/2 rounded-full bg-slate-800 px-5 py-2 text-sm text-white shadow-lg">
           {notice}
@@ -143,14 +186,12 @@ function BankCard({
   langCode,
   bank,
   onStart,
-  onDeleted,
-  onNotice,
+  onDeleteRequest,
 }: {
   langCode: string
   bank: BankVO
   onStart: (path: string) => void
-  onDeleted: () => void
-  onNotice: (msg: string) => void
+  onDeleteRequest: () => void
 }) {
   const [mode, setMode] = useState<'word' | 'sentence'>('word')
   const hasWords = bank.wordCount > 0
@@ -162,14 +203,8 @@ function BankCard({
   // 当前模式没有数据时自动切换
   const effectiveMode = !hasWords ? 'sentence' : !hasSentences ? 'word' : mode
 
-  const handleDelete = async () => {
-    if (!window.confirm(`确认删除词库「${bank.name}」？其中的单词/句子/学习记录都会被删除！`)) return
-    try {
-      await manageApi.deleteBank(bank.id)
-      onDeleted()
-    } catch (e) {
-      onNotice((e as Error).message)
-    }
+  const handleDelete = () => {
+    onDeleteRequest()
   }
 
   return (

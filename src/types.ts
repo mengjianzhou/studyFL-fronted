@@ -72,13 +72,32 @@ export interface LanguageVO {
   groups: GroupVO[]
 }
 
+/** 句子切分单元 */
+export interface SentenceSegment {
+  /** 表面文本（日语为原文，英语为单词） */
+  text: string
+  /** 读音（罗马音 / 音标） */
+  reading?: string
+  /** 中文释义 */
+  meaning?: string
+  /** 词性标签：noun / particle / verb / auxiliary / adjective / adverb … */
+  type?: string
+  /** 是否作为填空（true 时需用户填写，false 为提示骨架） */
+  isBlank?: boolean | string
+}
+
 export interface PracticeItem {
   id: number
   /** 需要打的内容 */
   text: string
   phonetic: string | null
   meaning: string
+  english?: string | null
+  chinese?: string | null
+  japanese?: string | null
   extra: string | null
+  /** 切分单元列表（后端已切分时），null 表示未切分 */
+  segments?: SentenceSegment[]
 }
 
 export interface PracticeItemsResponse {

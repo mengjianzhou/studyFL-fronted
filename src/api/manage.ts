@@ -25,6 +25,7 @@ export interface SentenceSaveRequest {
   chinese?: string
   japanese?: string
   sentenceType?: string
+  segmentsJson?: string
 }
 
 export const manageApi = {
