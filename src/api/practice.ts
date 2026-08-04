@@ -12,6 +12,7 @@ export interface SubmitPayload {
   elapsedMs: number
   isDictation: boolean
   dictationScore?: number
+  itemResults?: { itemId: number; success: boolean }[]
 }
 
 export const practiceApi = {

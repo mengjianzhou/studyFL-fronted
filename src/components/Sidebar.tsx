@@ -67,6 +67,16 @@ export default function Sidebar() {
 
       <div className="border-t border-slate-200 px-4 py-3">
         <NavLink
+          to="/memory-rules"
+          className={({ isActive }) =>
+            `mb-1 block rounded-lg px-3 py-2 text-sm transition ${
+              isActive ? 'bg-brand-bg font-medium text-brand-dark' : 'text-slate-600 hover:bg-slate-50'
+            }`
+          }
+        >
+          记忆规则
+        </NavLink>
+        <NavLink
           to="/stats"
           className={({ isActive }) =>
             `block rounded-lg px-3 py-2 text-sm transition ${

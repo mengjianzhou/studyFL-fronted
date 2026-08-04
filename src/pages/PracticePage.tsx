@@ -78,6 +78,7 @@ export default function PracticePage() {
   const wordWiseKeystrokesRef = useRef(0)
   const wordWiseCorrectFirstRef = useRef(0)
   const wordWiseItemWrongRef = useRef(false)
+  const itemResultsRef = useRef<Map<number, boolean>>(new Map())
   const { speak, supported } = useSpeech(bank?.langCode ?? 'en')
 
   const isDictationPhase = phase === 'dictation' || phase === 'dictationResult'
@@ -116,6 +117,7 @@ export default function PracticePage() {
     wordWiseKeystrokesRef.current = 0
     wordWiseCorrectFirstRef.current = 0
     wordWiseItemWrongRef.current = false
+    itemResultsRef.current = new Map()
     setPhase('typing')
     startTimeRef.current = Date.now()
   }, [])
@@ -129,7 +131,8 @@ export default function PracticePage() {
       .words(Number(bankId), mode, 'shuffle')
       .then((res) => {
         if (res.items.length === 0) {
-          setNotice('这个词库还没有数据')
+          setItems([])
+          setNotice(mode === 'word' ? '今天没有到期单词，或这个词库还没有单词' : '这个词库还没有句子')
           setPhase('typing')
           return
         }
@@ -146,12 +149,14 @@ export default function PracticePage() {
   /** 切分单元：优先使用后端 segments，否则按空格/全角空格自动拆分 */
   const segments = useMemo(() => {
     if (current?.segments && current.segments.length > 0) {
-      return current.segments.map((s) => ({
-        text: s.text,
-        reading: s.reading ?? '',
-        furigana: (s as Segment).furigana ?? '',
-        meaning: s.meaning ?? '',
-      }))
+      return current.segments
+        .filter((segment) => !isPunctuationSegment(segment.text))
+        .map((s) => ({
+          text: s.text,
+          reading: s.reading ?? '',
+          furigana: (s as Segment).furigana ?? '',
+          meaning: s.meaning ?? '',
+        }))
     }
     // 回退：按空格拆分
     const words = normalizedTarget.split(/[\s\u3000]+/).filter((w) => w.length > 0)
@@ -162,16 +167,17 @@ export default function PracticePage() {
   const sentenceSegments = useMemo<Segment[] | null>(() => {
     const raw = current?.segments
     if (raw && raw.length > 0) {
+      const wordSegments = raw.filter((segment) => !isPunctuationSegment(segment.text))
       // 仅当 segments 携带 isBlank 信息时才启用填空式显示，避免影响纯自动切分的旧数据
-      const hasBlankInfo = raw.some((s) => s.isBlank !== undefined)
+      const hasBlankInfo = wordSegments.some((s) => s.isBlank !== undefined)
       if (!hasBlankInfo) return null
-      return raw.map((s) => ({
+      return wordSegments.map((s) => ({
         text: s.text,
         reading: s.reading ?? '',
         furigana: (s as Segment).furigana ?? '',
         meaning: s.meaning ?? '',
         type: s.type ?? '',
-        isBlank: (s.isBlank === true || s.isBlank === 'true') && !isPunctuationSegment(s.text),
+        isBlank: s.isBlank === true || s.isBlank === 'true',
       }))
     }
     return null
@@ -200,20 +206,37 @@ export default function PracticePage() {
     setBlankInputs(sentenceSegments.map(() => ''))
     setBlankStates(sentenceSegments.map((s, i) => (s.isBlank ? (i === 0 ? 'active' : 'pending') : 'correct')))
     const first = sentenceSegments.findIndex((s) => s.isBlank)
-    setActiveBlank(first)
     segItemErrorRef.current = false
-    if (first >= 0) {
+    if (sentenceAnswerMode === 'study') {
+      setActiveBlank(-1)
+    } else if (first >= 0) {
+      setActiveBlank(first)
       setTimeout(() => blankRefs.current[first]?.focus(), 60)
     }
-  }, [current, sentenceSegments])
+  }, [current, sentenceSegments, sentenceAnswerMode])
+
+  useEffect(() => {
+    if (sentenceAnswerMode !== 'study' || phase !== 'typing' || !sentenceSegments || dialog) return
+
+    const handleStudyModeKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'ArrowRight' || event.isComposing || event.altKey || event.ctrlKey || event.metaKey) return
+      if (currentIndex >= items.length - 1) return
+      event.preventDefault()
+      setCurrentIndex((index) => Math.min(index + 1, items.length - 1))
+    }
+
+    window.addEventListener('keydown', handleStudyModeKeyDown)
+    return () => window.removeEventListener('keydown', handleStudyModeKeyDown)
+  }, [currentIndex, dialog, items.length, phase, sentenceAnswerMode, sentenceSegments])
 
   /** 整词通过（日语 / 默写模式）：Enter 提交整词比对 */
   const checkWhole = useCallback(() => {
     if (!current) return
     setTotalKeystrokes((n) => n + input.length)
-    const ok = input.trim().toLowerCase() === (current.text?.trim().toLowerCase() ?? '')
+    const ok = normalizeWholeAnswer(input, isJa) === normalizeWholeAnswer(current.text ?? '', isJa)
     if (ok) {
       const oneShot = !wrongThisWordRef.current && input.length > 0
+      if (mode === 'word') itemResultsRef.current.set(current.id, oneShot)
       wrongThisWordRef.current = false
       setInput('')
       setFlash(true)
@@ -255,6 +278,7 @@ export default function PracticePage() {
         const newInput = input + actual
         if (newInput.length >= normalizedTarget.length) {
           const oneShot = !wrongThisWordRef.current
+          if (mode === 'word') itemResultsRef.current.set(current.id, oneShot)
           wrongThisWordRef.current = false
           setInput('')
           setFlash(true)
@@ -315,7 +339,9 @@ export default function PracticePage() {
   const finish = useCallback((overrides?: { correctFirst?: number; errorCount?: number; totalKeystrokes?: number }) => {
     const elapsed = Date.now() - startTimeRef.current
     setElapsedMs(elapsed)
-    setPhase((p) => (p === 'dictation' ? 'dictationResult' : 'result'))
+    const isDictationRound = phase === 'dictation'
+    setPhase(isDictationRound ? 'dictationResult' : 'result')
+    if (isDictationRound) return
     setSubmitting(true)
     practiceApi
       .submit({
@@ -328,10 +354,11 @@ export default function PracticePage() {
         totalKeystrokes: overrides?.totalKeystrokes ?? totalKeystrokes,
         elapsedMs: elapsed,
         isDictation: false,
+        itemResults: mode === 'word' ? Array.from(itemResultsRef.current, ([itemId, success]) => ({ itemId, success })) : undefined,
       })
       .catch((e) => setNotice((e as Error).message))
       .finally(() => setSubmitting(false))
-  }, [bankId, correctFirst, errorCount, items.length, mode, totalKeystrokes])
+  }, [bankId, correctFirst, errorCount, items.length, mode, phase, totalKeystrokes])
 
   /** 逐词模式：每个词独立判定，错误词也允许继续 */
   const handleWordWiseEnter = useCallback(() => {
@@ -461,6 +488,7 @@ export default function PracticePage() {
     setCurrentIndex(0)
     wrongThisWordRef.current = false
     wrongWordsRef.current = new Set()
+    itemResultsRef.current = new Map()
     startTimeRef.current = Date.now()
     const shuffled = [...items].sort(() => Math.random() - 0.5)
     setItems(shuffled)
@@ -485,6 +513,7 @@ export default function PracticePage() {
           elapsedMs: elapsed,
           isDictation: true,
           dictationScore,
+          itemResults: mode === 'word' ? Array.from(itemResultsRef.current, ([itemId, success]) => ({ itemId, success })) : undefined,
         })
         .catch((e) => setNotice((e as Error).message))
         .finally(() => setSubmitting(false))
@@ -653,6 +682,13 @@ export default function PracticePage() {
 
       {phase === 'loading' && (
         <div className="flex flex-1 items-center justify-center text-slate-400">加载词库中…</div>
+      )}
+
+      {(phase === 'typing' || phase === 'dictation') && !current && (
+        <div className="flex flex-1 flex-col items-center justify-center text-center">
+          <div className="text-lg font-medium text-slate-700">今天没有需要练习的内容</div>
+          <p className="mt-2 text-sm text-slate-400">已掌握的单词会在规则设定的日期再次出现</p>
+        </div>
       )}
 
       {(phase === 'typing' || phase === 'dictation') && current && (
@@ -1378,14 +1414,16 @@ function getEditFieldValues(item: PracticeItem, isCreate: boolean, jaLayout: boo
 function getEditSegments(item: PracticeItem, mode: 'word' | 'sentence', isCreate: boolean, sourceText: string, isJa: boolean) {
   if (mode !== 'sentence') return []
   if (!isCreate && item.segments && item.segments.length > 0) {
-    return item.segments.map((segment) => ({
-      text: segment.text,
-      reading: segment.reading ?? '',
-      furigana: (segment as Segment).furigana ?? '',
-      meaning: segment.meaning ?? '',
-      type: segment.type ?? '',
-      isBlank: segment.isBlank === true || segment.isBlank === 'true',
-    }))
+    return item.segments
+      .filter((segment) => !isPunctuationSegment(segment.text))
+      .map((segment) => ({
+        text: segment.text,
+        reading: segment.reading ?? '',
+        furigana: (segment as Segment).furigana ?? '',
+        meaning: segment.meaning ?? '',
+        type: segment.type ?? '',
+        isBlank: segment.isBlank === true || segment.isBlank === 'true',
+      }))
   }
   const splitSegments = autoSplitText(sourceText, isJa)
   return splitSegments.length > 0 ? splitSegments : createEmptySegments()
@@ -1536,8 +1574,8 @@ function EditItemModal({
       setError(mode === 'sentence' ? '英文内容不能为空' : '单词不能为空')
       return
     }
-    const filledSegments = segments.filter((segment) =>
-      segment.text.trim() || segment.meaning.trim() || segment.reading.trim(),
+    const filledSegments = segments.filter(
+      (segment) => !isPunctuationSegment(segment.text) && (segment.text.trim() || segment.meaning.trim() || segment.reading.trim()),
     )
     const incompleteSegmentIndex = filledSegments.findIndex((segment) => !segment.text.trim())
     if (mode === 'sentence' && incompleteSegmentIndex >= 0) {
@@ -1569,16 +1607,29 @@ function EditItemModal({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30" onClick={onClose}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30" role="presentation">
       <div
         className="max-h-[calc(100vh-2rem)] w-full max-w-3xl overflow-y-auto rounded-2xl bg-white p-6 shadow-xl"
-        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="practice-editor-title"
       >
-        <h3 className="mb-4 text-lg font-semibold text-slate-800">
-          {isCreate
-            ? `新增${mode === 'sentence' ? '句子' : '单词'}到本词库`
-            : `${mode === 'sentence' ? '编辑句子' : '编辑单词'}`}
-        </h3>
+        <div className="mb-4 flex items-center justify-between gap-4">
+          <h3 id="practice-editor-title" className="text-lg font-semibold text-slate-800">
+            {isCreate
+              ? `新增${mode === 'sentence' ? '句子' : '单词'}到本词库`
+              : `${mode === 'sentence' ? '编辑句子' : '编辑单词'}`}
+          </h3>
+          <button
+            type="button"
+            onClick={onClose}
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-xl leading-none text-slate-400 transition hover:bg-slate-100 hover:text-slate-700"
+            title="关闭"
+            aria-label="关闭编辑窗口"
+          >
+            ×
+          </button>
+        </div>
         {mode === 'sentence' ? (
           jaLayout ? (
             /* 日语模式新增：日文在前（失焦自动翻译英文），中文手动输入 */
@@ -1768,4 +1819,9 @@ function fmtTime(ms: number) {
   const s = Math.floor(ms / 1000)
   const m = Math.floor(s / 60)
   return `${m}:${String(s % 60).padStart(2, '0')}`
+}
+
+function normalizeWholeAnswer(value: string, ignoreWhitespace: boolean) {
+  const normalized = value.normalize('NFKC').trim().toLocaleLowerCase()
+  return ignoreWhitespace ? normalized.replace(/\s+/gu, '') : normalized
 }
